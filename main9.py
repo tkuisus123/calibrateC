@@ -9,6 +9,168 @@ from scipy.ndimage import gaussian_filter1d
 from datetime import datetime
 from matplotlib.patches import Polygon
 from mpl_toolkits.mplot3d import art3d
+import math
+
+
+def straighten_image_with_hough(image):
+    """
+    Straighten an image using Hough Transform to detect prominent vertical lines.
+    
+    This function detects vertical lines in the image and calculates the median
+    angle to determine the overall tilt. It then applies a rotation transformation
+    to make the lines perfectly vertical, effectively correcting rotational drift.
+    
+    Args:
+        image (numpy.ndarray): Input mosaic image to be straightened
+        
+    Returns:
+        tuple: (straightened_image, rotation_angle, line_info)
+            - straightened_image: The corrected image with vertical lines
+            - rotation_angle: The angle (in degrees) that was applied for correction
+            - line_info: Dictionary with detection statistics
+    """
+    if image is None or image.size == 0:
+        return image, 0, {"error": "Invalid input image"}
+    
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Edge detection using Canny
+    # Adaptive thresholds based on image statistics
+    mean_intensity = np.mean(blurred)
+    low_threshold = max(50, int(mean_intensity * 0.5))
+    high_threshold = min(200, int(mean_intensity * 1.5))
+    
+    edges = cv2.Canny(blurred, low_threshold, high_threshold)
+    
+    # Line detection using HoughLinesP
+    # Parameters tuned for detecting prominent lines
+    rho = 1  # Distance resolution in pixels
+    theta = np.pi / 180  # Angular resolution in radians (1 degree)
+    threshold = max(50, min(image.shape[0], image.shape[1]) // 4)  # Minimum votes
+    min_line_length = max(100, min(image.shape[0], image.shape[1]) // 8)  # Minimum line length
+    max_line_gap = 20  # Maximum gap between line segments
+    
+    lines = cv2.HoughLinesP(edges, rho, theta, threshold, 
+                           minLineLength=min_line_length, maxLineGap=max_line_gap)
+    
+    line_info = {
+        "total_lines_detected": 0,
+        "vertical_lines": 0,
+        "angles": [],
+        "median_angle": 0,
+        "edge_pixels": np.sum(edges > 0),
+        "canny_thresholds": (low_threshold, high_threshold)
+    }
+    
+    if lines is None or len(lines) == 0:
+        print("Warning: No lines detected in image")
+        return image, 0, line_info
+    
+    line_info["total_lines_detected"] = len(lines)
+    
+    # Calculate angles of detected lines and filter for nearly vertical ones
+    angles = []
+    vertical_lines = []
+    
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        
+        # Calculate angle of the line relative to horizontal
+        if x2 - x1 == 0:
+            # Perfectly vertical line
+            angle = 0.0  # 0 degrees deviation from vertical
+        else:
+            # Calculate angle in degrees relative to horizontal
+            angle_from_horizontal = math.degrees(math.atan2(y2 - y1, x2 - x1))
+            
+            # Convert to deviation from vertical
+            # Vertical lines should be at 90° or -90° from horizontal
+            if abs(angle_from_horizontal) > 45:
+                # Line is more vertical than horizontal
+                if angle_from_horizontal > 0:
+                    angle = angle_from_horizontal - 90  # Deviation from perfect vertical
+                else:
+                    angle = angle_from_horizontal + 90  # Deviation from perfect vertical
+            else:
+                # Line is more horizontal, skip it
+                continue
+        
+        # Filter for nearly vertical lines (within 30 degrees of vertical)
+        if abs(angle) <= 30:  # Lines within 30 degrees of perfect vertical
+            angles.append(angle)
+            vertical_lines.append(line[0])
+    
+    line_info["vertical_lines"] = len(vertical_lines)
+    line_info["angles"] = angles
+    
+    if len(angles) < 3:
+        print(f"Warning: Only {len(angles)} nearly vertical lines found. Using original image.")
+        return image, 0, line_info
+    
+    # Calculate median angle for robust estimation (less sensitive to outliers)
+    median_angle = np.median(angles)
+    line_info["median_angle"] = median_angle
+    
+    # The median angle is already the rotation needed to make lines vertical
+    rotation_angle = -median_angle  # Negative because we want to counter the tilt
+    
+    # Limit rotation to reasonable range
+    if abs(rotation_angle) > 45:
+        print(f"Warning: Large rotation angle detected ({rotation_angle:.2f}°). Limiting to ±45°.")
+        rotation_angle = np.sign(rotation_angle) * min(abs(rotation_angle), 45)
+    
+    print(f"Detected tilt: {median_angle:.2f}°, applying correction: {rotation_angle:.2f}°")
+    print(f"Analysis: {len(vertical_lines)} vertical lines from {len(lines)} total lines")
+    
+    # Apply rotation transformation using cv2.warpAffine
+    height, width = image.shape[:2]
+    
+    # Calculate rotation matrix around image center
+    center = (width // 2, height // 2)
+    rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+    
+    # Calculate new bounding box to ensure no content is cropped
+    # Get corner points of the original image
+    corners = np.array([
+        [0, 0, 1],
+        [width, 0, 1],
+        [width, height, 1],
+        [0, height, 1]
+    ]).T
+    
+    # Transform corner points
+    transformed_corners = rotation_matrix @ corners
+    
+    # Find the new bounding box
+    x_coords = transformed_corners[0, :]
+    y_coords = transformed_corners[1, :]
+    
+    min_x, max_x = np.min(x_coords), np.max(x_coords)
+    min_y, max_y = np.min(y_coords), np.max(y_coords)
+    
+    # Calculate new image dimensions
+    new_width = int(np.ceil(max_x - min_x))
+    new_height = int(np.ceil(max_y - min_y))
+    
+    # Adjust translation to ensure all content is visible
+    rotation_matrix[0, 2] += -min_x
+    rotation_matrix[1, 2] += -min_y
+    
+    # Apply the rotation with the new dimensions
+    straightened_image = cv2.warpAffine(image, rotation_matrix, (new_width, new_height),
+                                       flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                       borderValue=(0, 0, 0))
+    
+    print(f"Original size: {width}x{height}, Straightened size: {new_width}x{new_height}")
+    
+    return straightened_image, rotation_angle, line_info
 
 # Custom JSON encoder to handle NumPy types
 class NumpyEncoder(json.JSONEncoder):
@@ -4525,6 +4687,118 @@ if __name__ == '__main__':
         print("2. Adjust the coordinates in the 'vertices' list in the 'manual_triangle_params' dictionary")
         print("3. Run the code again to see the updated triangle position")
         print("4. Repeat until the triangle is positioned exactly where you want it")
+
+        # MOSAICKING: Create example mosaics for demonstration of straightening
+        print("\n=======================================")
+        print("  IMAGE MOSAICKING WITH STRAIGHTENING")
+        print("=======================================")
+        
+        # Create demonstration mosaic images from saved visualization
+        print("\nCreating demonstration mosaic images...")
+        
+        # Try to load the visualization image if it exists
+        viz_file = saved_files.get('viz')
+        if viz_file and os.path.exists(viz_file):
+            try:
+                # Load the visualization image as a demonstration mosaic
+                demo_mosaic = cv2.imread(viz_file)
+                if demo_mosaic is not None:
+                    print(f"Loaded visualization as demonstration mosaic: {viz_file}")
+                    
+                    # Create synthetic RGB and depth mosaics for demonstration
+                    final_rgb_mosaic = demo_mosaic
+                    final_depth_mosaic = cv2.cvtColor(demo_mosaic, cv2.COLOR_BGR2GRAY)
+                    
+                    # Add some artificial tilt to demonstrate the straightening
+                    height, width = final_rgb_mosaic.shape[:2]
+                    center = (width // 2, height // 2)
+                    tilt_angle = 3.0  # 3 degree artificial tilt
+                    tilt_matrix = cv2.getRotationMatrix2D(center, tilt_angle, 1.0)
+                    
+                    tilted_rgb = cv2.warpAffine(final_rgb_mosaic, tilt_matrix, (width, height))
+                    tilted_depth = cv2.warpAffine(final_depth_mosaic, tilt_matrix, (width, height))
+                    
+                    print(f"Applied {tilt_angle}° artificial tilt for demonstration")
+                    
+                    # Save the tilted versions
+                    tilted_rgb_path = f"{base_filename}_tilted_rgb_mosaic.png"
+                    tilted_depth_path = f"{base_filename}_tilted_depth_mosaic.png"
+                    
+                    cv2.imwrite(tilted_rgb_path, tilted_rgb)
+                    cv2.imwrite(tilted_depth_path, tilted_depth)
+                    
+                    print(f"Saved tilted RGB mosaic: {tilted_rgb_path}")
+                    print(f"Saved tilted depth mosaic: {tilted_depth_path}")
+                    
+                    # Apply straightening function to both mosaics
+                    print("\nApplying Hough Transform straightening...")
+                    
+                    # Straighten RGB mosaic
+                    print("Straightening RGB mosaic...")
+                    straightened_rgb, rgb_angle, rgb_info = straighten_image_with_hough(tilted_rgb)
+                    
+                    # Straighten depth mosaic
+                    print("Straightening depth mosaic...")
+                    straightened_depth, depth_angle, depth_info = straighten_image_with_hough(tilted_depth)
+                    
+                    # Save straightened mosaics
+                    straightened_rgb_path = f"{base_filename}_straightened_rgb_mosaic.png"
+                    straightened_depth_path = f"{base_filename}_straightened_depth_mosaic.png"
+                    
+                    cv2.imwrite(straightened_rgb_path, straightened_rgb)
+                    cv2.imwrite(straightened_depth_path, straightened_depth)
+                    
+                    print(f"Saved straightened RGB mosaic: {straightened_rgb_path}")
+                    print(f"Saved straightened depth mosaic: {straightened_depth_path}")
+                    
+                    # Save analysis report
+                    mosaic_report_path = f"{base_filename}_mosaic_analysis.txt"
+                    with open(mosaic_report_path, 'w') as f:
+                        f.write("IMAGE MOSAICKING STRAIGHTENING ANALYSIS\n")
+                        f.write("=" * 50 + "\n\n")
+                        f.write(f"Generated: {timestamp}\n\n")
+                        
+                        f.write("RGB MOSAIC ANALYSIS:\n")
+                        f.write(f"  Original tilt applied: {tilt_angle:.2f}°\n")
+                        f.write(f"  Detected tilt: {rgb_info.get('median_angle', 0):.2f}°\n")
+                        f.write(f"  Correction applied: {rgb_angle:.2f}°\n")
+                        f.write(f"  Lines detected: {rgb_info.get('total_lines_detected', 0)}\n")
+                        f.write(f"  Vertical lines used: {rgb_info.get('vertical_lines', 0)}\n\n")
+                        
+                        f.write("DEPTH MOSAIC ANALYSIS:\n")
+                        f.write(f"  Original tilt applied: {tilt_angle:.2f}°\n")
+                        f.write(f"  Detected tilt: {depth_info.get('median_angle', 0):.2f}°\n")
+                        f.write(f"  Correction applied: {depth_angle:.2f}°\n")
+                        f.write(f"  Lines detected: {depth_info.get('total_lines_detected', 0)}\n")
+                        f.write(f"  Vertical lines used: {depth_info.get('vertical_lines', 0)}\n\n")
+                        
+                        f.write("EFFECTIVENESS:\n")
+                        error_rgb = abs(rgb_angle + tilt_angle)  # How close we got to correcting the tilt
+                        error_depth = abs(depth_angle + tilt_angle)
+                        f.write(f"  RGB correction error: {error_rgb:.2f}°\n")
+                        f.write(f"  Depth correction error: {error_depth:.2f}°\n")
+                        f.write(f"  Average error: {(error_rgb + error_depth) / 2:.2f}°\n")
+                    
+                    print(f"Saved mosaic analysis report: {mosaic_report_path}")
+                    
+                    # Display summary
+                    print("\nMOSAIC STRAIGHTENING SUMMARY:")
+                    print(f"  Original artificial tilt: {tilt_angle:.2f}°")
+                    print(f"  RGB mosaic - Detected: {rgb_info.get('median_angle', 0):.2f}°, Corrected: {rgb_angle:.2f}°")
+                    print(f"  Depth mosaic - Detected: {depth_info.get('median_angle', 0):.2f}°, Corrected: {depth_angle:.2f}°")
+                    print(f"  Files created: tilted versions, straightened versions, analysis report")
+                    
+                else:
+                    print("Could not load visualization image for mosaic demonstration")
+                    
+            except Exception as e:
+                print(f"Error creating mosaic demonstration: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("No visualization image available for mosaic demonstration")
+            print("Note: The straighten_image_with_hough() function is available for use with real mosaics")
+            print("Usage: straightened_image, angle, info = straighten_image_with_hough(mosaic_image)")
 
         print("\n=======================================")
         print(f"All results saved to: {os.path.abspath(output_dir)}")

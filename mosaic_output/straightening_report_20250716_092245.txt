@@ -1,0 +1,22 @@
+IMAGE STRAIGHTENING ANALYSIS REPORT
+==================================================
+
+Generated: 20250716_092245
+
+RGB MOSAIC ANALYSIS:
+  Rotation applied: -45.00°
+  Lines detected: 20
+  Vertical lines: 12
+  Median angle: 85.06°
+
+DEPTH MOSAIC ANALYSIS:
+  Rotation applied: -45.00°
+  Lines detected: 20
+  Vertical lines: 12
+  Median angle: 85.06°
+
+SAVED FILES:
+  original_rgb: mosaic_output/rgb_mosaic_20250716_092245.png
+  original_depth: mosaic_output/depth_mosaic_20250716_092245.png
+  straightened_rgb: mosaic_output/straightened_rgb_mosaic_20250716_092245.png
+  straightened_depth: mosaic_output/straightened_depth_mosaic_20250716_092245.png
